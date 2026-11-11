@@ -7,3 +7,6 @@ venv/
 # 运行产物(下载的原包、输出的 zip)
 output/
 _downloads/
+
+# WorkBuddy 本地项目数据(不入库)
+.workbuddy/
