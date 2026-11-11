@@ -7,27 +7,51 @@ import zipfile
 import tempfile
 import argparse
 import subprocess
+import threading
 import multiprocessing as mp
 from pathlib import Path
-from urllib.parse import urlsplit
 from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor, as_completed
 
 import requests
 from PIL import Image
 
 IMG_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".gif", ".tiff", ".webp"}
-DEFAULT_DOWNLOAD_WORKERS = 4
+DEFAULT_DOWNLOAD_WORKERS = 4          # 站点上限:5 个并发下载
 DEFAULT_DOWNLOAD_TIMEOUT = 180
-DEFAULT_GDL_SLEEP = 1.0
-BROWSER_UA = (
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-    "AppleWebKit/537.36 (KHTML, like Gecko) "
-    "Chrome/124.0.0.0 Safari/537.36"
+DEFAULT_GDL_SLEEP = 1.0               # 站点上限:1 请求/秒
+DEFAULT_MIN_REQUEST_INTERVAL = 1.0
+
+# pawchive 的 403 提示明确要求「可识别的 UA」,并指出:
+# "Excessive downloading or pretending to be a browser will result in a block."
+# 因此默认 UA 不能伪装成 Chrome/Firefox,且应带联系方式(可用环境变量覆盖)。
+DEFAULT_USER_AGENT = (
+    "WebPBatch/1.0 (+https://github.com/liu200501/action; "
+    "contact: 165114734+liu200501@users.noreply.github.com)"
 )
+
+_RATE_LOCK = threading.Lock()
+_LAST_REQUEST_AT = 0.0
+
+
+def user_agent() -> str:
+    """可通过 DOWNLOAD_USER_AGENT 覆盖,建议换成自己的真实联系方式。"""
+    return os.environ.get("DOWNLOAD_USER_AGENT", "").strip() or DEFAULT_USER_AGENT
+
+
+def throttle(min_interval: float) -> None:
+    """全局节流:同一进程内任意两次下载请求至少间隔 min_interval 秒。"""
+    global _LAST_REQUEST_AT
+    if min_interval <= 0:
+        return
+    with _RATE_LOCK:
+        wait = min_interval - (time.monotonic() - _LAST_REQUEST_AT)
+        if wait > 0:
+            time.sleep(wait)
+        _LAST_REQUEST_AT = time.monotonic()
 
 
 def custom_headers() -> dict:
-    """从环境变量注入自定义请求头 / Cookie,用于对抗 403。
+    """从环境变量注入自定义请求头 / Cookie。
 
     DOWNLOAD_HEADERS: 形如 "Referer:https://xxx/;X-Token:abc"
     DOWNLOAD_COOKIE : 从浏览器复制出来的完整 Cookie 字符串
@@ -46,14 +70,11 @@ def custom_headers() -> dict:
     return result
 
 
-def request_headers(url: str) -> dict:
-    """浏览器化的请求头,尽量贴近正常浏览器的下载行为。"""
-    parsed = urlsplit(url)
+def request_headers() -> dict:
+    """只带必要请求头;不伪造浏览器特征(站点会据此判定为 bot)。"""
     headers = {
-        "User-Agent": BROWSER_UA,
+        "User-Agent": user_agent(),
         "Accept": "application/zip,application/octet-stream,*/*;q=0.8",
-        "Accept-Language": "en-US,en;q=0.9",
-        "Referer": f"{parsed.scheme}://{parsed.netloc}/",
     }
     headers.update(custom_headers())
     return headers
@@ -61,7 +82,8 @@ def request_headers(url: str) -> dict:
 
 def download_with_gallery_dl(url: str, dest: Path,
                              timeout: int = DEFAULT_DOWNLOAD_TIMEOUT,
-                             sleep_request: float = DEFAULT_GDL_SLEEP) -> Path:
+                             sleep_request: float = DEFAULT_GDL_SLEEP,
+                             min_interval: float = DEFAULT_MIN_REQUEST_INTERVAL) -> Path:
     """主下载器:调用 gallery-dl,自动处理 UA / 重试 / 请求限速 / 直链。
 
     注意:带签名的 CDN 直链(如 t4.pawchive.pw/xxx.zip?e=..&s=..)在
@@ -80,13 +102,14 @@ def download_with_gallery_dl(url: str, dest: Path,
         "--no-mtime",
         "--retries", "3",
         "--sleep-request", str(sleep_request),
-        "--user-agent", BROWSER_UA,
+        "--user-agent", user_agent(),
     ]
     for key, value in custom_headers().items():
         cmd += ["-o", f"headers.{key}={value}"]
     cmd.append(url)
 
     try:
+        throttle(min_interval)
         proc = subprocess.run(
             cmd, check=True, timeout=timeout,
             capture_output=True, text=True,
@@ -113,15 +136,17 @@ def download_with_gallery_dl(url: str, dest: Path,
 
 
 def download_with_requests(url: str, dest: Path,
-                           timeout: int = DEFAULT_DOWNLOAD_TIMEOUT) -> Path:
-    """兜底下载器:浏览器化请求头 + 流式写入 + 重试 + .part 原子替换。"""
+                           timeout: int = DEFAULT_DOWNLOAD_TIMEOUT,
+                           min_interval: float = DEFAULT_MIN_REQUEST_INTERVAL) -> Path:
+    """兜底下载器:可识别 UA + 流式写入 + 重试 + .part 原子替换。"""
     print(f"[requests 下载] {url}", flush=True)
     dest.parent.mkdir(parents=True, exist_ok=True)
     part = dest.with_name(dest.name + ".part")
-    headers = request_headers(url)
+    headers = request_headers()
     last_error = None
     for attempt in range(1, 4):
         try:
+            throttle(min_interval)
             with requests.get(url, stream=True, timeout=timeout, headers=headers) as r:
                 r.raise_for_status()
                 with open(part, "wb") as f:
@@ -142,7 +167,8 @@ def download_with_requests(url: str, dest: Path,
 
 def download(url: str, dest: Path, timeout: int = DEFAULT_DOWNLOAD_TIMEOUT,
              downloader: str = "auto",
-             gdl_sleep: float = DEFAULT_GDL_SLEEP) -> Path:
+             gdl_sleep: float = DEFAULT_GDL_SLEEP,
+             min_interval: float = DEFAULT_MIN_REQUEST_INTERVAL) -> Path:
     """下载编排:auto 先试 gallery-dl,失败自动回退 requests。
 
     gallery-dl 只支持站点 extractor 与通用直链;普通 zip 直链若因 403、
@@ -150,18 +176,19 @@ def download(url: str, dest: Path, timeout: int = DEFAULT_DOWNLOAD_TIMEOUT,
     """
     if downloader in ("auto", "gallery-dl"):
         try:
-            return download_with_gallery_dl(url, dest, timeout, gdl_sleep)
+            return download_with_gallery_dl(url, dest, timeout, gdl_sleep, min_interval)
         except Exception as exc:
             print(f"[gallery-dl 失败] {url}: {exc}", file=sys.stderr, flush=True)
             if downloader == "gallery-dl":
                 raise
             print(f"[回退 requests] {url}", file=sys.stderr, flush=True)
-    return download_with_requests(url, dest, timeout)
+    return download_with_requests(url, dest, timeout, min_interval)
 
 
 def download_all(urls, downloads_dir: Path, workers: int = DEFAULT_DOWNLOAD_WORKERS,
                  downloader: str = "auto", timeout: int = DEFAULT_DOWNLOAD_TIMEOUT,
-                 gdl_sleep: float = DEFAULT_GDL_SLEEP):
+                 gdl_sleep: float = DEFAULT_GDL_SLEEP,
+                 min_interval: float = DEFAULT_MIN_REQUEST_INTERVAL):
     tasks = []
     used = set()
     for i, url in enumerate(urls, 1):
@@ -178,7 +205,8 @@ def download_all(urls, downloads_dir: Path, workers: int = DEFAULT_DOWNLOAD_WORK
     results = []
     with ThreadPoolExecutor(max_workers=workers) as pool:
         future_map = {
-            pool.submit(download, url, path, timeout, downloader, gdl_sleep): (url, path)
+            pool.submit(download, url, path, timeout, downloader, gdl_sleep, min_interval):
+                (url, path)
             for url, path in tasks
         }
         for fut in as_completed(future_map):
@@ -284,6 +312,9 @@ def main():
     parser.add_argument("--download-timeout", type=int, default=DEFAULT_DOWNLOAD_TIMEOUT)
     parser.add_argument("--gdl-sleep", type=float, default=DEFAULT_GDL_SLEEP,
                         help="gallery-dl 每次 HTTP 请求间隔(秒)")
+    parser.add_argument("--min-request-interval", type=float,
+                        default=DEFAULT_MIN_REQUEST_INTERVAL,
+                        help="跨线程全局最小请求间隔(秒),遵守站点 1 req/s 限制")
     parser.add_argument("--keep-originals", action="store_true")
     args = parser.parse_args()
 
@@ -301,14 +332,18 @@ def main():
     cpu = os.cpu_count() or 2
     print(f"CPU 核数={cpu},下载并发={args.download_workers},"
           f"转换进程={args.convert_workers},zip 级别={args.compress_level},"
-          f"下载器={args.downloader}")
+          f"下载器={args.downloader},UA={user_agent()}")
+    if args.download_workers > 5 or args.min_request_interval < 1.0:
+        print("[警告] 已超出站点建议的限速(1 请求/秒、5 个并发下载),可能被 403",
+              file=sys.stderr)
 
     print(f"\n=== 阶段 1:并发下载 {len(urls)} 个压缩包 ===")
     results = download_all(urls, downloads,
                            workers=args.download_workers,
                            downloader=args.downloader,
                            timeout=args.download_timeout,
-                           gdl_sleep=args.gdl_sleep)
+                           gdl_sleep=args.gdl_sleep,
+                           min_interval=args.min_request_interval)
 
     print(f"\n=== 阶段 2:解压 + 图片转 WebP + 重新打包 ===")
     for url, zip_path, err in results:
