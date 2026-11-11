@@ -1,12 +1,15 @@
 #!/usr/bin/env python3
 import os
 import sys
+import time
 import shutil
 import zipfile
 import tempfile
 import argparse
+import subprocess
 import multiprocessing as mp
 from pathlib import Path
+from urllib.parse import urlsplit
 from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor, as_completed
 
 import requests
@@ -14,44 +17,179 @@ from PIL import Image
 
 IMG_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".gif", ".tiff", ".webp"}
 DEFAULT_DOWNLOAD_WORKERS = 4
+DEFAULT_DOWNLOAD_TIMEOUT = 180
+DEFAULT_GDL_SLEEP = 1.0
+BROWSER_UA = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/124.0.0.0 Safari/537.36"
+)
 
 
-def download(url: str, dest: Path, timeout=180) -> Path:
-    print(f"[下载开始] {url}")
-    headers = {"User-Agent": "Mozilla/5.0 (GitHubActions)"}
+def custom_headers() -> dict:
+    """从环境变量注入自定义请求头 / Cookie,用于对抗 403。
+
+    DOWNLOAD_HEADERS: 形如 "Referer:https://xxx/;X-Token:abc"
+    DOWNLOAD_COOKIE : 从浏览器复制出来的完整 Cookie 字符串
+    在 GitHub Actions 里可用 Repository Secrets 注入。
+    """
+    result = {}
+    raw = os.environ.get("DOWNLOAD_HEADERS", "")
+    for item in raw.split(";"):
+        if ":" in item:
+            key, value = item.split(":", 1)
+            if key.strip() and value.strip():
+                result[key.strip()] = value.strip()
+    cookie = os.environ.get("DOWNLOAD_COOKIE", "").strip()
+    if cookie:
+        result["Cookie"] = cookie
+    return result
+
+
+def request_headers(url: str) -> dict:
+    """浏览器化的请求头,尽量贴近正常浏览器的下载行为。"""
+    parsed = urlsplit(url)
+    headers = {
+        "User-Agent": BROWSER_UA,
+        "Accept": "application/zip,application/octet-stream,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Referer": f"{parsed.scheme}://{parsed.netloc}/",
+    }
+    headers.update(custom_headers())
+    return headers
+
+
+def download_with_gallery_dl(url: str, dest: Path,
+                             timeout: int = DEFAULT_DOWNLOAD_TIMEOUT,
+                             sleep_request: float = DEFAULT_GDL_SLEEP) -> Path:
+    """主下载器:调用 gallery-dl,自动处理 UA / 重试 / 请求限速 / 直链。
+
+    注意:带签名的 CDN 直链(如 t4.pawchive.pw/xxx.zip?e=..&s=..)在
+    gallery-dl 里匹配的是 DirectlinkExtractor,不会走站点专属 extractor。
+    """
+    print(f"[gallery-dl 下载] {url}", flush=True)
     dest.parent.mkdir(parents=True, exist_ok=True)
-    with requests.get(url, stream=True, timeout=timeout, headers=headers) as r:
-        r.raise_for_status()
-        with open(dest, "wb") as f:
-            for chunk in r.iter_content(chunk_size=1 << 16):
-                if chunk:
-                    f.write(chunk)
-    print(f"[下载完成] {dest.name} ({dest.stat().st_size} bytes)")
-    return dest
+    tmp_dir = dest.parent / f"_gdl_{dest.stem}"
+    shutil.rmtree(tmp_dir, ignore_errors=True)
+    tmp_dir.mkdir(parents=True, exist_ok=True)
+
+    cmd = [
+        sys.executable, "-m", "gallery_dl",
+        "--config-ignore",
+        "--destination", str(tmp_dir),
+        "--no-mtime",
+        "--retries", "3",
+        "--sleep-request", str(sleep_request),
+        "--user-agent", BROWSER_UA,
+    ]
+    for key, value in custom_headers().items():
+        cmd += ["-o", f"headers.{key}={value}"]
+    cmd.append(url)
+
+    try:
+        proc = subprocess.run(
+            cmd, check=True, timeout=timeout,
+            capture_output=True, text=True,
+            encoding="utf-8", errors="replace",
+        )
+        files = [p for p in tmp_dir.rglob("*") if p.is_file() and p.stat().st_size > 0]
+        if not files:
+            detail = (proc.stdout or proc.stderr or "").strip()[-500:]
+            raise RuntimeError(f"gallery-dl 未下载到文件: {detail}")
+        downloaded = max(files, key=lambda p: p.stat().st_size)
+        dest.unlink(missing_ok=True)
+        shutil.move(str(downloaded), str(dest))
+        print(f"[下载完成] {dest.name} ({dest.stat().st_size} bytes) [gallery-dl]", flush=True)
+        return dest
+    except FileNotFoundError as exc:
+        raise RuntimeError("gallery-dl 未安装(pip install gallery-dl)") from exc
+    except subprocess.TimeoutExpired as exc:
+        raise RuntimeError(f"gallery-dl 超时({timeout}s): {url}") from exc
+    except subprocess.CalledProcessError as exc:
+        detail = (exc.stderr or exc.stdout or "").strip()[-800:]
+        raise RuntimeError(f"gallery-dl 退出码 {exc.returncode}: {detail}") from exc
+    finally:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
 
 
-def download_all(urls, downloads_dir: Path, workers: int = DEFAULT_DOWNLOAD_WORKERS):
+def download_with_requests(url: str, dest: Path,
+                           timeout: int = DEFAULT_DOWNLOAD_TIMEOUT) -> Path:
+    """兜底下载器:浏览器化请求头 + 流式写入 + 重试 + .part 原子替换。"""
+    print(f"[requests 下载] {url}", flush=True)
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    part = dest.with_name(dest.name + ".part")
+    headers = request_headers(url)
+    last_error = None
+    for attempt in range(1, 4):
+        try:
+            with requests.get(url, stream=True, timeout=timeout, headers=headers) as r:
+                r.raise_for_status()
+                with open(part, "wb") as f:
+                    for chunk in r.iter_content(chunk_size=1 << 16):
+                        if chunk:
+                            f.write(chunk)
+            part.replace(dest)
+            print(f"[下载完成] {dest.name} ({dest.stat().st_size} bytes) [requests]", flush=True)
+            return dest
+        except Exception as exc:
+            last_error = exc
+            part.unlink(missing_ok=True)
+            print(f"[重试 {attempt}/3] {url}: {exc}", file=sys.stderr, flush=True)
+            if attempt < 3:
+                time.sleep(2 * attempt)
+    raise RuntimeError(f"requests 下载失败(3 次): {url}: {last_error}")
+
+
+def download(url: str, dest: Path, timeout: int = DEFAULT_DOWNLOAD_TIMEOUT,
+             downloader: str = "auto",
+             gdl_sleep: float = DEFAULT_GDL_SLEEP) -> Path:
+    """下载编排:auto 先试 gallery-dl,失败自动回退 requests。
+
+    gallery-dl 只支持站点 extractor 与通用直链;普通 zip 直链若因 403、
+    未安装或超时失败,仍需 requests 兜底,避免整批任务失效。
+    """
+    if downloader in ("auto", "gallery-dl"):
+        try:
+            return download_with_gallery_dl(url, dest, timeout, gdl_sleep)
+        except Exception as exc:
+            print(f"[gallery-dl 失败] {url}: {exc}", file=sys.stderr, flush=True)
+            if downloader == "gallery-dl":
+                raise
+            print(f"[回退 requests] {url}", file=sys.stderr, flush=True)
+    return download_with_requests(url, dest, timeout)
+
+
+def download_all(urls, downloads_dir: Path, workers: int = DEFAULT_DOWNLOAD_WORKERS,
+                 downloader: str = "auto", timeout: int = DEFAULT_DOWNLOAD_TIMEOUT,
+                 gdl_sleep: float = DEFAULT_GDL_SLEEP):
     tasks = []
+    used = set()
     for i, url in enumerate(urls, 1):
         name = url.split("?")[0].rstrip("/").split("/")[-1] or f"archive_{i}.zip"
         if not name.lower().endswith(".zip"):
             name = f"archive_{i}.zip"
+        stem, seq = name[:-4], 2
+        while name in used:
+            name = f"{stem}_{seq}.zip"
+            seq += 1
+        used.add(name)
         tasks.append((url, downloads_dir / name))
 
-    results = {}
+    results = []
     with ThreadPoolExecutor(max_workers=workers) as pool:
         future_map = {
-            pool.submit(download, url, path): (url, path) for url, path in tasks
+            pool.submit(download, url, path, timeout, downloader, gdl_sleep): (url, path)
+            for url, path in tasks
         }
         for fut in as_completed(future_map):
             url, path = future_map[fut]
             try:
                 fut.result()
-                results[url] = (path, None)
+                results.append((url, path, None))
             except Exception as e:
                 print(f"[下载失败] {url}: {e}", file=sys.stderr)
-                results[url] = (None, e)
-    return [(u, *results[u]) for u in urls]
+                results.append((url, None, e))
+    return results
 
 
 def convert_one(args):
@@ -140,10 +278,16 @@ def main():
     parser.add_argument("--download-workers", type=int, default=DEFAULT_DOWNLOAD_WORKERS)
     parser.add_argument("--convert-workers", type=int,
                         default=max(1, (os.cpu_count() or 2)))
+    parser.add_argument("--downloader", choices=["auto", "gallery-dl", "requests"],
+                        default="auto",
+                        help="auto=先 gallery-dl 失败回退 requests(默认)")
+    parser.add_argument("--download-timeout", type=int, default=DEFAULT_DOWNLOAD_TIMEOUT)
+    parser.add_argument("--gdl-sleep", type=float, default=DEFAULT_GDL_SLEEP,
+                        help="gallery-dl 每次 HTTP 请求间隔(秒)")
     parser.add_argument("--keep-originals", action="store_true")
     args = parser.parse_args()
 
-    urls = [ln.strip() for ln in Path(args.urls).read_text().splitlines()
+    urls = [ln.strip() for ln in Path(args.urls).read_text(encoding="utf-8-sig").splitlines()
             if ln.strip() and not ln.strip().startswith("#")]
     if not urls:
         print("没有 URL 可处理")
@@ -156,10 +300,15 @@ def main():
 
     cpu = os.cpu_count() or 2
     print(f"CPU 核数={cpu},下载并发={args.download_workers},"
-          f"转换进程={args.convert_workers},zip 级别={args.compress_level}")
+          f"转换进程={args.convert_workers},zip 级别={args.compress_level},"
+          f"下载器={args.downloader}")
 
     print(f"\n=== 阶段 1:并发下载 {len(urls)} 个压缩包 ===")
-    results = download_all(urls, downloads, workers=args.download_workers)
+    results = download_all(urls, downloads,
+                           workers=args.download_workers,
+                           downloader=args.downloader,
+                           timeout=args.download_timeout,
+                           gdl_sleep=args.gdl_sleep)
 
     print(f"\n=== 阶段 2:解压 + 图片转 WebP + 重新打包 ===")
     for url, zip_path, err in results:
