@@ -11,20 +11,18 @@ on:
         description: "最大边长(像素,留空表示不缩放)"
         required: false
         default: ""
+      compress_level:
+        description: "zip 压缩级别 1-9(越大越慢)"
+        required: false
+        default: "6"
   push:
     paths:
       - "urls.txt"
       - "scripts/process.py"
-      - "requirements.txt"
       - ".github/workflows/process.yml"
 
-# 发布 Release 需要写权限
 permissions:
   contents: write
-
-concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
 
 jobs:
   build:
@@ -47,33 +45,29 @@ jobs:
           pip install -r requirements.txt
 
       - name: Run process
-        id: run
         env:
           QUALITY: ${{ github.event.inputs.quality || '80' }}
           MAX_SIZE: ${{ github.event.inputs.max_size || '' }}
+          COMPRESS_LEVEL: ${{ github.event.inputs.compress_level || '6' }}
         run: |
-          set -euo pipefail
           EXTRA=""
           if [ -n "$MAX_SIZE" ]; then EXTRA="--max-size $MAX_SIZE"; fi
           python scripts/process.py \
             --urls urls.txt \
             --output output \
             --quality "$QUALITY" \
+            --compress-level "$COMPRESS_LEVEL" \
             $EXTRA
 
-      # 脚本会把 has_output / produced / failed 写到 GITHUB_OUTPUT,
-      # urls.txt 只有注释或全部下载失败时不会误报 artifact 缺失。
       - name: Upload artifacts
-        if: steps.run.outputs.has_output == 'true'
         uses: actions/upload-artifact@v4
         with:
           name: webp-zips
           path: output/*.zip
           if-no-files-found: error
-          retention-days: 7
 
       - name: Create Release
-        if: github.event_name == 'workflow_dispatch' && steps.run.outputs.has_output == 'true'
+        if: github.event_name == 'workflow_dispatch'
         uses: softprops/action-gh-release@v2
         with:
           tag_name: build-${{ github.run_number }}
