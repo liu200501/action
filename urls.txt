@@ -1,0 +1,12 @@
+# 每行一个 zip 下载地址;以 # 开头的行为注释,空行自动忽略。
+# 编辑本文件并推送后会自动触发 .github/workflows/process.yml。
+#
+# 也可以在仓库的 Actions 页面手动 "Run workflow",
+# 可临时指定 WebP 质量(quality)和最大边长(max_size)。
+#
+# 产物: Actions 运行页的 Artifacts(webp-zips);
+#       手动触发时还会同时发布到 Release(build-<run_number>)。
+#
+# 示例(替换成真实地址后取消注释):
+# https://example.com/pack1.zip
+# https://example.com/pack2.zip

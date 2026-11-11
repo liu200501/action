@@ -1,0 +1,9 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# 运行产物(下载的原包、输出的 zip)
+output/
+_downloads/
