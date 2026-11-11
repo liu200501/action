@@ -26,7 +26,7 @@ DEFAULT_MIN_REQUEST_INTERVAL = 1.0
 # 因此默认 UA 不能伪装成 Chrome/Firefox,且应带联系方式(可用环境变量覆盖)。
 DEFAULT_USER_AGENT = (
     "WebPBatch/1.0 (+https://github.com/liu200501/action; "
-    "contact: 165114734+liu200501@users.noreply.github.com)"
+    "contact: 970656489@qq.com)"
 )
 
 _RATE_LOCK = threading.Lock()
@@ -34,7 +34,7 @@ _LAST_REQUEST_AT = 0.0
 
 
 def user_agent() -> str:
-    """可通过 DOWNLOAD_USER_AGENT 覆盖,建议换成自己的真实联系方式。"""
+    """默认 UA 已带真实联系方式;如需覆盖可设置 DOWNLOAD_USER_AGENT。"""
     return os.environ.get("DOWNLOAD_USER_AGENT", "").strip() or DEFAULT_USER_AGENT
 
 
