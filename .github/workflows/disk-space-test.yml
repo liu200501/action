@@ -1,0 +1,255 @@
+name: Disk Space Test
+
+run-name: "💾 测盘 ${{ inputs.prune_docker && 'docker清' || 'docker留' }} / ${{ inputs.purge_apt && 'apt清' || 'apt留' }}"
+
+# 独立测试用途：不绑 push，只能在 Actions 页面手动 Run workflow。
+# 目标：删掉 runner 上除「业务链路用到的工具」以外的一切预装工具链，
+# 看单机能腾出多少可用空间（给 50GB 级解包任务做容量评估）。
+on:
+  workflow_dispatch:
+    inputs:
+      purge_apt:
+        description: "额外 apt purge 预装大包（浏览器/JDK/数据库/R/mono/云CLI 等）"
+        required: false
+        type: boolean
+        default: true
+      prune_docker:
+        description: "清理 docker 本地镜像/容器/构建缓存"
+        required: false
+        type: boolean
+        default: true
+      trim_misc:
+        description: "再删 man/doc/apt 缓存等零碎"
+        required: false
+        type: boolean
+        default: true
+      check_tools:
+        description: "清理后校验业务所需工具是否仍可用"
+        required: false
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+env:
+  REPORT: /tmp/space-report
+
+jobs:
+  disk:
+    name: "腾空间 + 测上限"
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: 0) 基线：清理前磁盘水位
+        run: |
+          set -uo pipefail
+          mkdir -p "$REPORT"
+          echo "========== 清理前 =========="
+          df -h / /tmp /mnt 2>/dev/null | tee "$REPORT/before.txt" || true
+          AVAIL_BEFORE=$(df --output=avail -B1 / | tail -1 | tr -d ' ')
+          echo "AVAIL_BEFORE=$AVAIL_BEFORE" >> "$GITHUB_ENV"
+          echo "清理前可用: $(numfmt --to=iec "$AVAIL_BEFORE")"
+          echo "========== 根目录一级占用 TOP =========="
+          sudo du -xhd1 / 2>/dev/null | sort -hr | head -25 | tee "$REPORT/du-before.txt" || true
+          echo "========== 候选目标体积 =========="
+          for p in /usr/local/lib/android /opt/hostedtoolcache /usr/share/dotnet \
+                   /opt/ghc /usr/local/.ghcup /usr/share/swift /usr/local/share/boost \
+                   /usr/lib/jvm /usr/lib/mono /usr/share/miniconda /opt/rubies \
+                   /usr/local/rustup /usr/local/cargo /opt/az /opt/google/chrome \
+                   /opt/microsoft/msedge /usr/lib/firefox /usr/local/share/chromium \
+                   /var/lib/docker /usr/share/php /usr/lib/R; do
+            if [ -e "$p" ]; then
+              printf "  %-38s %s\n" "$p" "$(sudo du -sh "$p" 2>/dev/null | cut -f1)"
+            fi
+          done | tee "$REPORT/candidates.txt" || true
+
+      - name: 1) 删除业务用不到的语言/工具链（白名单外全删）
+        run: |
+          set -uo pipefail
+          echo "========== 删除明细 ==========" | tee "$REPORT/dropped.txt"
+          drop() {
+            local p="$1"
+            if [ -e "$p" ]; then
+              local sz rc=0
+              sz=$(sudo du -sh "$p" 2>/dev/null | cut -f1)
+              sudo rm -rf "$p" 2>/dev/null || rc=$?
+              echo "  - $p  (原 ${sz:-?}, rc=$rc)" | tee -a "$REPORT/dropped.txt"
+            fi
+          }
+          # ---- SDK / 语言运行时：业务链路完全用不到 ----
+          drop /usr/local/lib/android                 # Android SDK（最大头，10~16G）
+          drop /opt/hostedtoolcache                   # Go/Ruby/Node/Python/CodeQL 等全部预装版本
+          drop /usr/share/dotnet                      # .NET SDK + 运行时
+          drop /opt/ghc                               # Haskell GHC
+          drop /usr/local/.ghcup                      # Haskell cabal/stack/home
+          drop /usr/share/swift                       # Swift 工具链
+          drop /usr/local/share/boost                 # Boost C++ 库
+          drop /usr/lib/jvm                           # 全套 JDK/JRE（业务不需要 java）
+          drop /usr/lib/mono /usr/share/mono          # Mono / .NET Framework 兼容层
+          drop /usr/share/miniconda                   # Conda
+          drop /opt/rubies /usr/local/rvm /home/runner/.rvm
+          drop /usr/local/rustup /usr/local/cargo /home/runner/.rustup /home/runner/.cargo
+          drop /usr/share/php /home/runner/.composer
+          drop /usr/lib/R /usr/local/lib/R
+          drop /opt/julia /home/runner/.julia
+          drop /opt/mssql-tools /opt/microsoft
+          drop /opt/az /usr/local/share/powershell
+          drop /usr/local/aws-cli /usr/local/aws /home/runner/.local/lib/aws
+          # ---- 图形/浏览器：无头任务用不到 ----
+          drop /opt/google/chrome
+          drop /opt/microsoft/msedge
+          drop /usr/lib/firefox
+          drop /usr/local/share/chromium
+          drop /usr/lib/chromium /usr/lib/chromium-browser
+          # 注意：以下逐一保留，业务链路依赖
+          #   /usr/bin,/usr/lib 核心、python3+pip、ffmpeg/ffprobe、7z/7zz、zip/unzip、
+          #   jq、curl/wget、git、gpg、sqlite3、tar、bsdtar(bsdutils/libarchive)、
+          #   rclone、file、docker(含 daemon/buildx)、sudo、node(actions 自身用)
+
+      - name: 2) apt 清理：purge 预装大包
+        if: ${{ inputs.purge_apt }}
+        run: |
+          set -uo pipefail
+          echo "========== apt purge ==========" | tee -a "$REPORT/dropped.txt"
+          PKGS="firefox google-chrome-stable microsoft-edge-stable \
+                mono-complete mono-devel mono-runtime \
+                php8.3-cli php8.3-fpm php-pear php8.3-dev \
+                mysql-client mysql-server mysql-server-8.0 \
+                postgresql postgresql-client postgresql-16 \
+                mssql-tools18 unixodbc-dev \
+                r-base r-base-core r-base-dev \
+                powershell azure-cli google-cloud-cli awscli \
+                temurin-17-jdk temurin-21-jdk temurin-8-jdk \
+                zulu-17-jdk zulu-21-jdk adoptopenjdk-11-hotspot \
+                libboost-all-dev julia hercules"
+          INSTALLED=$(dpkg-query -W -f='${Package}\n' $PKGS 2>/dev/null | sort -u || true)
+          if [ -z "$INSTALLED" ]; then
+            echo "  无匹配的预装包（可能是 24.04 精简镜像）"
+          else
+            echo "$INSTALLED" | sed 's/^/  purge: /' | tee -a "$REPORT/dropped.txt"
+            sudo apt-get purge -y --auto-remove $INSTALLED >/dev/null 2>&1 || true
+          fi
+          sudo apt-get autoremove -y >/dev/null 2>&1 || true
+          sudo apt-get clean >/dev/null 2>&1 || true
+
+      - name: 3) docker 清理
+        if: ${{ inputs.prune_docker }}
+        run: |
+          set -uo pipefail
+          echo "========== docker ==========" | tee -a "$REPORT/dropped.txt"
+          BEFORE=$(sudo du -sh /var/lib/docker 2>/dev/null | cut -f1 || echo "?")
+          echo "  /var/lib/docker 清理前: $BEFORE" | tee -a "$REPORT/dropped.txt"
+          sudo docker system prune -af --volumes >/dev/null 2>&1 || true
+          sudo docker builder prune -af >/dev/null 2>&1 || true
+          AFTER=$(sudo du -sh /var/lib/docker 2>/dev/null | cut -f1 || echo "?")
+          echo "  /var/lib/docker 清理后: $AFTER" | tee -a "$REPORT/dropped.txt"
+
+      - name: 4) 零碎清理（man/doc/apt 缓存）
+        if: ${{ inputs.trim_misc }}
+        run: |
+          set -uo pipefail
+          echo "========== 零碎 ==========" | tee -a "$REPORT/dropped.txt"
+          for p in /usr/share/man /usr/share/doc /var/cache/apt /var/lib/apt/lists \
+                   /usr/local/share/man /opt/hostedtoolcache; do
+            if [ -e "$p" ]; then
+              sz=$(sudo du -sh "$p" 2>/dev/null | cut -f1)
+              sudo rm -rf "$p" 2>/dev/null || sudo find "$p" -mindepth 1 -delete 2>/dev/null || true
+              echo "  - $p  (原 ${sz:-?})" | tee -a "$REPORT/dropped.txt"
+            fi
+          done
+          sudo mkdir -p /var/lib/apt/lists/partial || true
+
+      - name: 5) 清理后水位 + 结果汇总
+        run: |
+          set -uo pipefail
+          echo "========== 清理后 =========="
+          df -h / /tmp /mnt 2>/dev/null | tee "$REPORT/after.txt" || true
+          AVAIL_AFTER=$(df --output=avail -B1 / | tail -1 | tr -d ' ')
+          TOTAL=$(df --output=size -B1 / | tail -1 | tr -d ' ')
+          RELEASED=$(( AVAIL_AFTER - AVAIL_BEFORE ))
+          echo "清理后可用: $(numfmt --to=iec "$AVAIL_AFTER") / 总容量 $(numfmt --to=iec "$TOTAL")"
+          echo "净释放  : $(numfmt --to=iec "$RELEASED")"
+          echo "可用率  : $(awk -v a="$AVAIL_AFTER" -v t="$TOTAL" 'BEGIN{printf "%.1f%%", a*100/t}')" | tee -a "$REPORT/after.txt"
+          sudo du -xhd1 / 2>/dev/null | sort -hr | head -15 | tee "$REPORT/du-after.txt" || true
+          {
+            echo "## 💾 单机磁盘上限测试"
+            echo ""
+            echo "| 指标 | 值 |"
+            echo "|---|---|"
+            echo "| 清理前可用 | $(numfmt --to=iec "$AVAIL_BEFORE") |"
+            echo "| 清理后可用 | **$(numfmt --to=iec "$AVAIL_AFTER")** |"
+            echo "| 总容量 | $(numfmt --to=iec "$TOTAL") |"
+            echo "| 净释放 | $(numfmt --to=iec "$RELEASED") |"
+            echo "| 可用率 | $(awk -v a="$AVAIL_AFTER" -v t="$TOTAL" 'BEGIN{printf "%.1f%%", a*100/t}') |"
+            echo ""
+            echo "### 删除明细"
+            echo '```'
+            cat "$REPORT/dropped.txt" 2>/dev/null || true
+            echo '```'
+            echo ""
+            echo "### 清理后 df"
+            echo '```'
+            cat "$REPORT/after.txt" 2>/dev/null || true
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: 6) 校验业务工具是否仍在
+        if: ${{ inputs.check_tools }}
+        continue-on-error: true
+        run: |
+          set -uo pipefail
+          echo "========== 保留工具自检 ==========" | tee /tmp/keep.txt
+          check() {
+            local name="$1"; shift
+            if command -v "$name" >/dev/null 2>&1; then
+              v=$("$@" 2>&1 | head -1 | cut -c1-90)
+              printf "  ✅ %-10s %s\n" "$name" "$v"
+            else
+              printf "  ❌ %-10s 缺失\n" "$name"
+            fi
+          }
+          check git   git --version
+          check curl  curl --version
+          check jq    jq --version
+          check file  file --version
+          check tar   tar --version
+          check zip   zip -v
+          check unzip unzip -v
+          check gpg   gpg --version
+          check sqlite3 sqlite3 --version
+          check rclone rclone version
+          check ffmpeg ffmpeg -version
+          check ffprobe ffprobe -version
+          check python3 python3 --version
+          check pip3 pip3 --version
+          check docker docker --version
+          check qpdf  qpdf --version
+          echo "  --- 压缩引擎 ---"
+          if command -v 7zz >/dev/null 2>&1; then echo "  ✅ 7zz   $(7zz i 2>&1 | head -2 | tail -1 | cut -c1-60)";
+          elif command -v 7z >/dev/null 2>&1; then echo "  ✅ 7z     $(7z i 2>&1 | head -2 | tail -1 | cut -c1-60)";
+          else echo "  ❌ 7z/7zz 缺失（需 apt install p7zip-full）"; fi
+          echo "  --- Pillow ---"
+          python3 -c "import PIL, sys; print('  ✅ Pillow', PIL.__version__)" 2>&1 || echo "  ❌ Pillow 未安装（pip install Pillow）"
+          echo "  --- bsdtar ---"
+          command -v bsdtar >/dev/null 2>&1 && echo "  ✅ bsdtar 可用" || echo "  ⚠️ bsdtar 缺失（apt install libarchive-tools）"
+          echo "  --- docker daemon ---"
+          sudo docker info >/dev/null 2>&1 && echo "  ✅ docker daemon 可连接" || echo "  ❌ docker daemon 不可用"
+          echo ""
+          echo "  df 复核:"; df -h / | tail -1
+          {
+            echo ""
+            echo "### 保留工具自检"
+            echo '```'
+            cat /tmp/keep.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: 7) 落盘报告为 artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: disk-space-report
+          path: /tmp/space-report/
+          if-no-files-found: warn
